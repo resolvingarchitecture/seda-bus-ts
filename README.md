@@ -22,4 +22,4 @@ Bringing together SEDA and Bus architectural patterns is what this component att
 
 This component is implemented in [Java](https://github.com/resolvingarchitecture/seda-bus-java) and
 [Rust](https://github.com/resolvingarchitecture/seda-bus). This project seeks to replicate
-this design for embedding in browsers and Node.js projects.
+this design for embedding in browsers.
