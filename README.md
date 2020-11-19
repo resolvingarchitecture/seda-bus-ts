@@ -20,6 +20,6 @@ they're all just endpoints.
 
 Bringing together SEDA and Bus architectural patterns is what this component attempts.
 
-This component is implemented in [Java](https://github.com/reolvingarchitecture/seda-bus-java) and
+This component is implemented in [Java](https://github.com/resolvingarchitecture/seda-bus-java) and
 [Rust](https://github.com/resolvingarchitecture/seda-bus). This project seeks to replicate
 this design for embedding in browsers and Node.js projects.
