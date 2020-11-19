@@ -1,0 +1,7 @@
+{
+    "name": "ra-seda-bus",
+    "version": "0.0.1",
+    "description": "Staged Event-Driven Architectural Bus",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts"
+}
