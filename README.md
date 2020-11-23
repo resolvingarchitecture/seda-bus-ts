@@ -23,3 +23,7 @@ Bringing together SEDA and Bus architectural patterns is what this component att
 This component is also implemented in [Java](https://github.com/resolvingarchitecture/seda-bus-java) and
 [Rust](https://github.com/resolvingarchitecture/seda-bus). This project seeks to replicate
 this design from the original Java project into a Typescript version for embedding in browsers.
+
+It uses the [Service Worker](https://w3c.github.io/ServiceWorker/) as the foundation for providing
+multithreading. The following are additional information used:
+* https://medium.com/techtrument/multithreading-javascript-46156179cf9a

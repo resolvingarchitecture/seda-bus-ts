@@ -3,5 +3,13 @@
     "version": "0.0.1",
     "description": "Staged Event-Driven Architectural Bus",
     "main": "dist/index.js",
-    "types": "dist/index.d.ts"
+    "types": "dist/index.d.ts",
+    "dependencies": {},
+    "devDependencies": {
+        "ts-jest": "^26.4.4"
+    },
+    "scripts": {
+        "test": "jest",
+        "coverage": "jest --coverage"
+    }
 }
