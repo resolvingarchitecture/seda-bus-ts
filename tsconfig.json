@@ -26,9 +26,5 @@
     },
     "include": [
         "src/**/*"
-    ],
-    "angularCompilerOptions": {
-        "fullTemplateTypeCheck": false,
-        "strictInjectionParameters": false
-    }
+    ]
 }
