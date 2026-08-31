@@ -1,0 +1,51 @@
+{
+  "name": "@resolvingarchitecture/seda-bus",
+  "version": "0.1.0",
+  "description": "A small, broker-less, staged (SEDA-style) message bus for TypeScript / Node",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "example": "node --import tsx examples/pipeline.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "seda",
+    "message-bus",
+    "staged",
+    "concurrency",
+    "backpressure",
+    "pipeline"
+  ],
+  "author": "Brian Taylor <brian@resolvingarchitecture.io>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/resolvingarchitecture/seda-bus-ts.git"
+  },
+  "homepage": "https://resolvingarchitecture.io",
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
