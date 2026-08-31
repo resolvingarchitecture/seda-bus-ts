@@ -1,95 +1,62 @@
 /**
  * A small, broker-less, staged message bus.
  *
- * Work is decomposed into stages ({@link Channel}s) connected by bounded queues.
- * There are no threads: the event loop is the shared worker pool, and each stage
- * has its own concurrency limit (how many consumer invocations it may have in
- * flight at once). An optional bus-wide limit caps total in-flight work.
+ * Work is decomposed into stages ({@link SedaBus.channel}) connected by bounded
+ * queues. By default the event loop is the shared worker pool and each stage
+ * has its own concurrency limit; a stage may instead be configured to run its
+ * handler across real Worker threads (see {@link ChannelOptions.worker}), which
+ * lets CPU-bound stages parallelise across cores.
  *
  * What this is not: SEDA's original design also included a controller that
  * watched per-stage latency and queue depth at runtime and re-tuned resources
- * and shed load automatically. That adaptive controller is future work, as is a
- * worker_threads transport for parallel CPU-bound stages (see DESIGN.md).
+ * and shed load automatically. That adaptive controller is future work (see
+ * DESIGN.md).
  */
 import { advance, type Envelope } from "./envelope.js";
+import {
+  Backpressure,
+  Delivery,
+  type ChannelOptions,
+  type ChannelStats,
+  type Consumer,
+  type PublishOptions,
+} from "./policy.js";
+import {
+  InlineTransport,
+  WorkerTransport,
+  type StageTransport,
+} from "./worker/transport.js";
 
-/** Return `false` to nack (retry, then dead-letter). `true`/`void` acks. */
-export type Consumer<T = unknown> = (
-  env: Envelope<T>,
-) => boolean | void | Promise<boolean | void>;
+export { Backpressure, Delivery } from "./policy.js";
+export type {
+  ChannelOptions,
+  ChannelStats,
+  Consumer,
+  PublishOptions,
+  WorkerOptions,
+} from "./policy.js";
 
-export enum Delivery {
-  /** One consumer handles each envelope (round-robin across consumers). */
-  PointToPoint = "p2p",
-  /** Every consumer handles every envelope. */
-  PubSub = "pubsub",
-}
-
-export enum Backpressure {
-  /** `publish` stays pending until there is room (or its timeout elapses). */
-  Block = "block",
-  /** `publish` resolves `false` immediately when the queue is full. */
-  Reject = "reject",
-  /** Silently discard the envelope being offered. */
-  DropNewest = "drop-newest",
-  /** Evict the oldest queued envelope to make room. */
-  DropOldest = "drop-oldest",
-}
-
-export interface ChannelOptions {
-  /** Max queued envelopes before back-pressure applies. Default 1024. */
-  capacity?: number;
-  /** Max consumer invocations in flight for this stage. Default 1. */
-  concurrency?: number;
-  /** Point-to-point (default) or pub/sub fan-out. */
-  delivery?: Delivery;
-  /** What to do when the queue is full. Default `Block`. */
-  backpressure?: Backpressure;
-  /** Delivery attempts before an envelope is dead-lettered. Default 1. */
-  maxAttempts?: number;
-}
-
-export interface PublishOptions {
-  /** For `Block` back-pressure: give up waiting for room after this long. */
-  timeoutMs?: number;
-  /** Abort a pending `Block` publish. */
-  signal?: AbortSignal;
-  /** Invoked once the envelope finishes its whole itinerary. */
-  onComplete?: (env: Envelope) => void;
-}
-
-export interface ChannelStats {
-  depth: number;
-  inFlight: number;
-  enqueued: number;
-  delivered: number;
-  nacked: number;
-  dropped: number;
-  deadLettered: number;
-}
+/** Envelopes one drain turn handles before yielding back to the scheduler. */
+const BATCH = 32;
 
 interface Waiter {
   resolve: (ok: boolean) => void;
+  env: Envelope;
   timer?: NodeJS.Timeout;
   onAbort?: () => void;
   signal?: AbortSignal;
 }
 
-/** Envelopes one drain turn handles before yielding back to the scheduler. */
-const BATCH = 32;
-
 class Channel {
   readonly name: string;
   readonly capacity: number;
   readonly concurrency: number;
-  readonly delivery: Delivery;
   readonly backpressure: Backpressure;
   readonly maxAttempts: number;
+  readonly transport: StageTransport;
 
   private readonly queue: Envelope[] = [];
   private readonly waiters: Waiter[] = [];
-  readonly consumers: Consumer[] = [];
-  private rr = 0;
   inFlight = 0;
 
   readonly stats: ChannelStats = {
@@ -105,24 +72,30 @@ class Channel {
   constructor(name: string, opts: ChannelOptions) {
     this.name = name;
     this.capacity = Math.max(1, opts.capacity ?? 1024);
-    this.concurrency = Math.max(1, opts.concurrency ?? 1);
-    this.delivery = opts.delivery ?? Delivery.PointToPoint;
     this.backpressure = opts.backpressure ?? Backpressure.Block;
     this.maxAttempts = Math.max(1, opts.maxAttempts ?? 1);
+
+    if (opts.worker) {
+      if (opts.delivery === Delivery.PubSub) {
+        throw new Error(`channel "${name}": pub/sub is not supported for worker stages`);
+      }
+      const pool = Math.max(1, opts.worker.pool ?? opts.concurrency ?? 1);
+      this.concurrency = pool;
+      this.transport = new WorkerTransport({
+        module: opts.worker.module,
+        export: opts.worker.export,
+        pool,
+      });
+    } else {
+      this.concurrency = Math.max(1, opts.concurrency ?? 1);
+      this.transport = new InlineTransport(opts.delivery ?? Delivery.PointToPoint);
+    }
   }
 
   get depth(): number {
     return this.queue.length;
   }
 
-  nextConsumer(): Consumer | undefined {
-    if (this.consumers.length === 0) return undefined;
-    const c = this.consumers[this.rr % this.consumers.length];
-    this.rr = (this.rr + 1) % this.consumers.length;
-    return c;
-  }
-
-  /** Offer an envelope. Resolves true if queued, false if shed. */
   offer(env: Envelope, opts: PublishOptions): Promise<boolean> {
     if (this.queue.length < this.capacity) {
       this.enqueue(env);
@@ -146,7 +119,7 @@ class Channel {
   private block(env: Envelope, opts: PublishOptions): Promise<boolean> {
     if (opts.signal?.aborted) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
-      const waiter: Waiter = { resolve };
+      const waiter: Waiter = { resolve, env };
       if (opts.timeoutMs !== undefined) {
         waiter.timer = setTimeout(() => {
           this.removeWaiter(waiter);
@@ -164,8 +137,6 @@ class Channel {
         };
         opts.signal.addEventListener("abort", waiter.onAbort, { once: true });
       }
-      // Attach the pending envelope so a freed slot can take it.
-      (waiter as Waiter & { env: Envelope }).env = env;
       this.waiters.push(waiter);
     });
   }
@@ -182,7 +153,7 @@ class Channel {
 
   poll(): Envelope | undefined {
     const env = this.queue.shift();
-    if (env !== undefined) this.wakeOneWaiter();
+    if (env !== undefined) this.wakeWaiters();
     return env;
   }
 
@@ -190,9 +161,9 @@ class Channel {
     this.queue.unshift(env);
   }
 
-  private wakeOneWaiter(): void {
+  private wakeWaiters(): void {
     while (this.queue.length < this.capacity && this.waiters.length > 0) {
-      const w = this.waiters.shift() as Waiter & { env: Envelope };
+      const w = this.waiters.shift()!;
       if (w.timer) clearTimeout(w.timer);
       if (w.signal && w.onAbort) w.signal.removeEventListener("abort", w.onAbort);
       this.enqueue(w.env);
@@ -200,7 +171,6 @@ class Channel {
     }
   }
 
-  /** Fail every pending Block publish (used on shutdown). */
   rejectWaiters(): void {
     while (this.waiters.length > 0) {
       const w = this.waiters.shift()!;
@@ -218,7 +188,7 @@ class Channel {
 }
 
 export interface SedaBusOptions {
-  /** Cap total in-flight consumer invocations across all stages. Default: none. */
+  /** Cap total in-flight invocations across all stages. Default: none. */
   concurrency?: number;
 }
 
@@ -257,14 +227,16 @@ export class SedaBus {
     const drained = await this.awaitDrain(timeoutMs);
     this.running = false;
     for (const ch of this.channels.values()) ch.rejectWaiters();
+    await Promise.all([...this.channels.values()].map((c) => c.transport.close()));
     return drained;
   }
 
   /** Stop immediately without draining. */
-  shutdownNow(): void {
+  async shutdownNow(): Promise<void> {
     this.accepting = false;
     this.running = false;
     for (const ch of this.channels.values()) ch.rejectWaiters();
+    await Promise.all([...this.channels.values()].map((c) => c.transport.close()));
   }
 
   private async awaitDrain(timeoutMs: number): Promise<boolean> {
@@ -287,7 +259,7 @@ export class SedaBus {
   }
 
   subscribe<T = unknown>(name: string, consumer: Consumer<T>): this {
-    this.getOrCreate(name).consumers.push(consumer as Consumer);
+    this.getOrCreate(name).transport.addConsumer(consumer as Consumer);
     return this;
   }
 
@@ -359,21 +331,8 @@ export class SedaBus {
   }
 
   private async process(ch: Channel, env: Envelope): Promise<void> {
-    if (ch.consumers.length === 0) {
-      this.deadLetter(ch, env);
-      return;
-    }
     env.attempts++;
-
-    let ok: boolean;
-    if (ch.delivery === Delivery.PubSub) {
-      const results = await Promise.all(
-        ch.consumers.map((c) => safeReceive(c, env)),
-      );
-      ok = results.every(Boolean);
-    } else {
-      ok = await safeReceive(ch.nextConsumer()!, env);
-    }
+    const ok = await ch.transport.invoke(env);
 
     if (ok) {
       ch.stats.delivered++;
@@ -408,20 +367,9 @@ export class SedaBus {
     const dlqName = this.dlq.get(ch.name);
     if (dlqName) {
       const dlq = this.channels.get(dlqName);
-      if (dlq) {
-        void dlq.offer(env, {}).then(() => this.pump(dlq));
-      }
+      if (dlq) void dlq.offer(env, {}).then(() => this.pump(dlq));
     }
     this.callbacks.delete(env.id);
-  }
-}
-
-async function safeReceive(c: Consumer, env: Envelope): Promise<boolean> {
-  try {
-    const r = await c(env);
-    return r !== false;
-  } catch {
-    return false;
   }
 }
 

@@ -28,9 +28,9 @@ That does *not* prevent a SEDA bus — it changes what the bus is *for*.
 | Stages + queues | Kept as-is. Explicit pipeline structure. |
 | Admission control (bounded queues) | Kept. `capacity` per channel. |
 | Back-pressure / load shedding | Kept. `Block` / `Reject` / `DropNewest` / `DropOldest`. |
-| "One thread pool drains every stage" | The **event loop** is the shared pool. |
-| Per-stage worker allocation | A per-stage **concurrency limit**: max consumer invocations in flight for that stage. Optionally a bus-wide limit too. |
-| Parallel CPU-bound stages | **Not in this version** — see *Roadmap: worker_threads*. |
+| "One thread pool drains every stage" | The **event loop** is the shared pool for inline stages; a **`Worker` pool** for worker stages. |
+| Per-stage worker allocation | Inline: a concurrency limit (max invocations in flight). Worker: a fixed pool of `Worker` threads. Optionally a bus-wide limit too. |
+| Parallel CPU-bound stages | **Supported** — set `worker` on the channel (see *Transports*). |
 | Adaptive controller (runtime re-tuning, auto load-shedding) | Not implemented (same as the other three). |
 
 For **I/O-bound stages** — the overwhelming majority of Node work — the event
@@ -40,9 +40,9 @@ explicit back-pressure, routing slips, retry/dead-letter, and metrics. In that
 sense it occupies the same space as `p-queue` / `bottleneck`, formalised into a
 staged pipeline.
 
-For **CPU-bound stages**, a synchronous consumer blocks the whole loop; the
-queues simply back up while nothing else runs. Those belong in
-`worker_threads` — see the roadmap.
+For **CPU-bound stages**, a synchronous consumer would block the whole loop.
+Configure the stage with `worker` and its handler runs across a pool of `Worker`
+threads instead — see *Transports* below.
 
 ## Core types
 
@@ -70,7 +70,8 @@ A stage. Holds:
 - a bounded FIFO `queue` (array)
 - a list of pending `Block` publishers (`waiters`) — resolved in FIFO order as
   slots free up
-- its `consumers`
+- a `transport` (see *Transports*) — `InlineTransport` by default, or
+  `WorkerTransport` when `worker` is configured
 - `inFlight` — how many drain turns are currently running for this stage
 - `stats`
 
@@ -78,7 +79,7 @@ A stage. Holds:
 
 ## The scheduler
 
-There is no thread pool. Scheduling is a function, `pump(channel)`:
+Inline stages have no thread pool. Scheduling is a function, `pump(channel)`:
 
 ```
 while channel.depth > 0
@@ -91,10 +92,12 @@ while channel.depth > 0
 `pump` is called after every `publish` and at the end of every `drain`. Because
 JS is single-threaded, the `inFlight` / `globalInFlight` counters need no locks.
 
-`drain(channel)` pulls up to `BATCH` (32) envelopes, `await`ing each consumer,
-then decrements the counters and calls `pump` again. Multiple `drain` turns for
-the same stage run concurrently up to `concurrency`, each interleaved by the
-event loop while its consumer is awaiting I/O.
+`drain(channel)` pulls up to `BATCH` (32) envelopes, `await`ing
+`transport.invoke` for each, then decrements the counters and calls `pump`
+again. Multiple `drain` turns for the same stage run concurrently up to
+`concurrency`, each interleaved by the event loop while it awaits (a consumer's
+I/O, or a worker round-trip). For a worker stage, `concurrency` == pool size, so
+each in-flight `drain` turn maps to one busy `Worker`.
 
 ### Why a batch
 
@@ -115,11 +118,60 @@ busy stage from monopolising a `drain` turn indefinitely.
 
 On `shutdown`, all pending `Block` publishers resolve `false`.
 
-## Delivery
+## Transports
 
-- **PointToPoint**: round-robin across the channel's own consumers; one handles
-  each envelope.
+A stage's actual work runs through a `StageTransport`:
+
+```ts
+interface StageTransport {
+  invoke(env: Envelope): Promise<boolean>;  // process one; may mutate env in place
+  readonly ready: boolean;
+  addConsumer(consumer: Consumer): void;
+  close(): Promise<void>;
+}
+```
+
+`process()` in the bus is transport-agnostic — it does `env.attempts++`, `await
+ch.transport.invoke(env)`, then the retry / dead-letter logic. Only *how a stage
+runs* differs.
+
+### `InlineTransport` (default)
+
+Consumers are functions on the event loop. Holds the `consumers` list and does
+the delivery:
+
+- **PointToPoint**: round-robin across consumers; one handles each envelope.
 - **PubSub**: `Promise.all` over every consumer; ack only if all ack.
+
+`invoke` awaits the consumer and catches throws / rejections as a nack.
+
+### `WorkerTransport` (`worker` option)
+
+The stage handler is a **module** (not a closure — closures can't cross a thread
+boundary), run across a fixed pool of `Worker` threads.
+
+- **`WorkerPool`** spawns N workers of `worker/harness.ts`, each given
+  `{ module, export }` via `workerData`. It keeps a free-list and an acquire
+  queue; `invoke()` grabs a free worker, `postMessage`s `{ seq, envelope }`,
+  awaits the reply, releases the worker. A worker that errors or exits non-zero
+  is terminated and replaced (its in-flight envelope resolves as a nack).
+- **`worker/harness.ts`** runs inside each thread: `import()`s the module once,
+  then for every request calls the handler and posts back
+  `{ seq, ok, envelope }`.
+- The envelope crosses by **structured clone** (`postMessage`). It is returned
+  in the reply, and `WorkerTransport` copies `payload` / `headers` / `slip` back
+  onto the main-thread envelope — so worker stages compose in routing slips.
+  `id`, `to`, and `attempts` stay main-thread-controlled.
+- The queue, waiters, back-pressure, retry, and metrics all stay on the main
+  thread. Only the handler call is off-thread.
+- `addConsumer` throws. `pub/sub` + `worker` throws at channel registration.
+- The channel's `concurrency` becomes the pool size (`worker.pool` wins if set).
+  There is always a free worker because concurrent `drain` turns ≤ pool size.
+
+The harness URL is resolved as `./harness.ts` when running from source (tsx /
+ts-node) and `./harness.js` from the built package, keyed off `import.meta.url`.
+User modules are resolved: `URL` as-is, bare specifier passed through, path
+made absolute against `process.cwd()` then `pathToFileURL`.
 
 ## Routing slips
 
@@ -144,8 +196,9 @@ callback, if any, is dropped.
 - `resume()` re-enables publishing.
 - `shutdown({ timeoutMs })` stops accepting, waits until every channel has
   `depth === 0 && inFlight === 0` (or the timeout), fails pending `Block`
-  publishers, and resolves `true` if fully drained.
-- `shutdownNow()` skips the drain.
+  publishers, closes every transport (terminating Worker pools), and resolves
+  `true` if fully drained.
+- `shutdownNow()` skips the drain (still closes transports).
 
 ## Metrics
 
@@ -158,28 +211,22 @@ Per channel: `depth`, `inFlight`, `enqueued`, `delivered`, `nacked`, `dropped`,
 
 - ESM only (`"type": "module"`), `NodeNext` resolution. Internal imports use the
   `.js` extension so the emitted JS resolves without a bundler.
-- `tsc` emits `dist/` with `.js`, `.d.ts`, and source maps.
+- `tsc` emits `dist/` with `.js`, `.d.ts`, and source maps. `dist/worker/` holds
+  the harness the `Worker` pool loads.
 - Zero runtime dependencies. Dev-only: `typescript`, `tsx`, `@types/node`.
 - Tests use the built-in `node:test` runner via `tsx`; no test framework
-  dependency.
+  dependency. `tsx` also lets `Worker` load `.ts` handler modules in dev.
 
 ## Roadmap
 
-### worker_threads transport (parallel CPU-bound stages)
+### Zero-copy / shared-memory worker transport
 
-The bus core is transport-agnostic in principle: `process()` calls the consumer
-directly today (`InlineTransport`). A `WorkerTransport` would run a stage's
-consumers in a pool of `Worker`s, passing envelopes by:
+`WorkerTransport` uses structured clone today. For large or high-rate payloads:
 
-- **structured clone** (`postMessage`) — simple, serialization cost;
-- **transferables** (`ArrayBuffer`, `MessagePort`) — move ownership, zero-copy;
-- **`SharedArrayBuffer` + `Atomics`** — shared-memory queue with
+- **transferables** (`ArrayBuffer`, `MessagePort`) — move ownership, no copy;
+- **`SharedArrayBuffer` + `Atomics`** — a shared-memory ring buffer with
   `Atomics.wait` / `Atomics.notify`, the closest analogue to the Rust/Java
   shared-thread design and to free-threaded Python.
-
-This is the equivalent of the "adaptive controller" line in the other repos: the
-part that would make the SEDA name fully earned, deferred until the core is
-proven.
 
 ### Adaptive controller
 

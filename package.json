@@ -23,7 +23,8 @@
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --import tsx --test test/*.test.ts",
     "example": "node --import tsx examples/pipeline.ts",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "example:parallel": "node --import tsx examples/parallel.ts"
   },
   "keywords": [
     "seda",

@@ -3,16 +3,16 @@
  *
  * @packageDocumentation
  */
+export { SedaBus, type SedaBusOptions } from "./bus.js";
 export {
   Backpressure,
   Delivery,
-  SedaBus,
   type ChannelOptions,
   type ChannelStats,
   type Consumer,
   type PublishOptions,
-  type SedaBusOptions,
-} from "./bus.js";
+  type WorkerOptions,
+} from "./policy.js";
 export { advance, envelope, type Envelope, type EnvelopeInit } from "./envelope.js";
 
 export const version = "0.1.0";
