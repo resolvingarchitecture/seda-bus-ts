@@ -8,7 +8,9 @@
  */
 import { parentPort, workerData } from "node:worker_threads";
 
-type Handler = (env: unknown) => unknown | Promise<unknown>;
+import { Envelope } from "@resolvingarchitecture/ra-common";
+
+type Handler = (env: Envelope) => unknown | Promise<unknown>;
 
 interface Request {
   seq: number;
@@ -50,8 +52,9 @@ port.on("message", async (msg: Request) => {
     return;
   }
   try {
-    const result = await handler(msg.envelope);
-    port.postMessage({ seq: msg.seq, ok: result !== false, envelope: msg.envelope });
+    const env = Envelope.fromJSON(msg.envelope as Record<string, unknown>);
+    const result = await handler(env);
+    port.postMessage({ seq: msg.seq, ok: result !== false, envelope: env.toJSON() });
   } catch (err) {
     port.postMessage({
       seq: msg.seq,

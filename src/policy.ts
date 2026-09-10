@@ -1,9 +1,7 @@
 import type { Envelope } from "./envelope.js";
 
 /** Return `false` to nack (retry, then dead-letter). `true`/`void` acks. */
-export type Consumer<T = unknown> = (
-  env: Envelope<T>,
-) => boolean | void | Promise<boolean | void>;
+export type Consumer = (env: Envelope) => boolean | void | Promise<boolean | void>;
 
 export enum Delivery {
   /** One consumer handles each envelope (round-robin across consumers). */

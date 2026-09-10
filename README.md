@@ -7,10 +7,12 @@
 Work is decomposed into stages (`Channel`s) connected by bounded queues.
 There are no threads &mdash; the event loop is the shared worker pool, and each
 stage has its own concurrency limit (how many consumer invocations it may have
-in flight). Zero runtime dependencies.
+in flight). The only runtime dependency is
+[`@resolvingarchitecture/ra-common`](https://github.com/resolvingarchitecture/ra-common-ts),
+whose `Envelope` the bus carries (as `seda-bus-java` does via `ra-common-java`).
 
 ```ts
-import { SedaBus, envelope, Delivery } from "@resolvingarchitecture/seda-bus";
+import { SedaBus, makeEnvelope, Delivery } from "@resolvingarchitecture/seda-bus";
 
 const bus = new SedaBus();
 
@@ -18,17 +20,22 @@ bus.channel("ingest",    { capacity: 1000 });
 bus.channel("transform", { capacity: 1000, concurrency: 4 });
 bus.channel("sink",      { capacity: 1000 });
 
-bus.subscribe<string>("ingest",    (e) => { e.headers.receivedAt = String(Date.now()); });
-bus.subscribe<string>("transform", (e) => { e.payload = e.payload.toUpperCase(); });
-bus.subscribe<string>("sink",      (e) => { console.log(e.payload); });
+bus.subscribe("ingest",    (e) => { e.headers["receivedAt"] = String(Date.now()); });
+bus.subscribe("transform", (e) => { e.addContent((e.content() as string).toUpperCase()); });
+bus.subscribe("sink",      (e) => { console.log(e.content()); });
 
 await bus.publish(
-  envelope("ingest", "hello", { slip: ["transform", "sink"] }),
+  makeEnvelope("ingest", "hello", { slip: ["transform", "sink"] }),
   { onComplete: (e) => console.log("done", e.id) },
 );
 
 await bus.shutdown();
 ```
+
+Routing follows the envelope's `DynamicRoutingSlip` (LIFO, keyed by
+`route.service`). `makeEnvelope(to, payload, { slip })` keeps the ergonomic shape;
+`targetService(env)` is the channel an envelope is currently headed for; the
+payload is the document `CONTENT` value (`env.content()` / `env.addContent()`).
 
 ## Why a bus if Node is single-threaded?
 
@@ -51,12 +58,13 @@ threads instead of on the event loop:
 ```ts
 // stages/hash.ts  — the handler, loaded by each worker
 import { createHash } from "node:crypto";
-import type { Envelope } from "@resolvingarchitecture/seda-bus";
+import type { Envelope } from "@resolvingarchitecture/ra-common";
 
-export default function hash(env: Envelope<{ data: string; rounds: number }>) {
-  let acc = Buffer.from(env.payload.data);
-  for (let i = 0; i < env.payload.rounds; i++) acc = createHash("sha256").update(acc).digest();
-  env.headers.digest = acc.toString("hex");   // mutations flow back to the caller
+export default function hash(env: Envelope) {
+  const { data, rounds } = env.content() as { data: string; rounds: number };
+  let acc = Buffer.from(data);
+  for (let i = 0; i < rounds; i++) acc = createHash("sha256").update(acc).digest();
+  env.headers["digest"] = acc.toString("hex");   // mutations flow back to the caller
 }
 ```
 
@@ -74,9 +82,10 @@ bus.channel("hash", {
 Notes:
 
 - The handler is a **module**, not a closure &mdash; `subscribe()` on a worker
-  channel throws. Payloads must be structured-clone-safe (`postMessage`).
-- Envelope mutations (`payload`, `headers`, `slip`) made in the worker propagate
-  back, so worker stages compose in routing slips.
+  channel throws. The envelope crosses as JSON (`env.toJSON()` / `Envelope.fromJSON`),
+  so its `CONTENT` payload must be JSON-serialisable.
+- Envelope mutations (content, `headers`, routing slip) made in the worker
+  propagate back, so worker stages compose in routing slips.
 - A handler that returns `false` / throws nacks &rarr; retried, then
   dead-lettered, like any stage.
 - `pub/sub` delivery is not supported for worker stages (one handler module).
@@ -105,7 +114,7 @@ Constructing the bus starts it.
 
 ### `bus.subscribe<T>(name, consumer)`
 
-`consumer: (env: Envelope<T>) => boolean | void | Promise<boolean | void>`.
+`consumer: (env: Envelope) => boolean | void | Promise<boolean | void>`.
 Return `false` to nack (retry, then dead-letter). A thrown error / rejected
 promise also nacks &mdash; it never breaks the scheduler.
 

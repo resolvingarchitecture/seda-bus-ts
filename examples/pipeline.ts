@@ -3,7 +3,7 @@
  *
  *   npm run example
  */
-import { SedaBus, envelope, type Envelope } from "../src/index.js";
+import { SedaBus, makeEnvelope, type Envelope } from "../src/index.js";
 
 async function main() {
   const bus = new SedaBus();
@@ -12,16 +12,16 @@ async function main() {
   bus.channel("transform", { capacity: 100, concurrency: 2 });
   bus.channel("sink", { capacity: 100 });
 
-  bus.subscribe<string>("ingest", (e) => {
+  bus.subscribe("ingest", (e) => {
     e.headers["seen_by"] = "ingest";
   });
-  bus.subscribe<string>("transform", (e) => {
-    e.payload = e.payload.toUpperCase();
+  bus.subscribe("transform", (e) => {
+    e.addContent((e.content() as string).toUpperCase());
   });
 
   const seen: string[] = [];
-  bus.subscribe<string>("sink", (e) => {
-    seen.push(e.payload);
+  bus.subscribe("sink", (e) => {
+    seen.push(e.content() as string);
   });
 
   let done = 0;
@@ -30,7 +30,7 @@ async function main() {
   };
 
   for (const word of ["alpha", "bravo", "charlie", "delta", "echo"]) {
-    await bus.publish(envelope("ingest", word, { slip: ["transform", "sink"] }), {
+    await bus.publish(makeEnvelope("ingest", word, { slip: ["transform", "sink"] }), {
       onComplete,
     });
   }

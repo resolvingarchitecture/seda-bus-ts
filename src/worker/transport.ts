@@ -7,7 +7,7 @@
  */
 import { Delivery } from "../policy.js";
 import type { Consumer } from "../policy.js";
-import type { Envelope } from "../envelope.js";
+import { Envelope } from "../envelope.js";
 import { WorkerPool, type WorkerSpec } from "./pool.js";
 
 export interface StageTransport {
@@ -70,12 +70,11 @@ export class WorkerTransport implements StageTransport {
   }
 
   async invoke(env: Envelope): Promise<boolean> {
-    const { ok, envelope } = await this.pool.invoke(serialisable(env));
-    const returned = envelope as Envelope | undefined;
-    if (returned) {
-      env.payload = returned.payload;
-      env.headers = returned.headers;
-      env.slip = returned.slip;
+    const { ok, envelope } = await this.pool.invoke(env.toJSON());
+    if (envelope) {
+      // rehydrate the worker's mutations and copy the data props back onto the
+      // envelope the scheduler is still holding (methods live on the prototype).
+      Object.assign(env, Envelope.fromJSON(envelope as Record<string, unknown>));
     }
     return ok;
   }
@@ -83,19 +82,6 @@ export class WorkerTransport implements StageTransport {
   close(): Promise<void> {
     return this.pool.close();
   }
-}
-
-/** A plain, structured-clone-safe copy of the envelope for postMessage. */
-function serialisable(env: Envelope): Envelope {
-  return {
-    id: env.id,
-    to: env.to,
-    sender: env.sender,
-    headers: { ...env.headers },
-    payload: env.payload,
-    slip: [...env.slip],
-    attempts: env.attempts,
-  };
 }
 
 export async function safeReceive(c: Consumer, env: Envelope): Promise<boolean> {

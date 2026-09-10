@@ -5,7 +5,7 @@ import {
   Backpressure,
   Delivery,
   SedaBus,
-  envelope,
+  makeEnvelope,
   type Envelope,
 } from "../src/index.js";
 
@@ -38,7 +38,7 @@ test("point-to-point round-robins across consumers", async () => {
   }
 
   for (let i = 0; i < 20; i++) {
-    assert.equal(await bus.publish(envelope("work", i)), true);
+    assert.equal(await bus.publish(makeEnvelope("work", i)), true);
   }
   await done.promise;
   await bus.shutdown();
@@ -51,14 +51,14 @@ test("pub/sub fans out to every consumer", async () => {
   const seenA: number[] = [];
   const seenB: number[] = [];
   bus.channel("events", { capacity: 100, delivery: Delivery.PubSub });
-  bus.subscribe<number>("events", (e) => {
-    seenA.push(e.payload);
+  bus.subscribe("events", (e) => {
+    seenA.push(e.content() as number);
   });
-  bus.subscribe<number>("events", (e) => {
-    seenB.push(e.payload);
+  bus.subscribe("events", (e) => {
+    seenB.push(e.content() as number);
   });
 
-  for (let i = 0; i < 5; i++) await bus.publish(envelope("events", i));
+  for (let i = 0; i < 5; i++) await bus.publish(makeEnvelope("events", i));
   await waitFor(() => seenA.length === 5 && seenB.length === 5);
   await bus.shutdown();
   assert.deepEqual([...seenA].sort(), [0, 1, 2, 3, 4]);
@@ -75,7 +75,7 @@ test("routing slip visits every stage in order", async () => {
     });
   }
   const done = deferred<Envelope>();
-  await bus.publish(envelope("one", "x", { slip: ["two", "three"] }), {
+  await bus.publish(makeEnvelope("one", "x", { slip: ["two", "three"] }), {
     onComplete: (e) => done.resolve(e),
   });
   await done.promise;
@@ -96,7 +96,7 @@ test("back-pressure Reject sheds when the queue is full", async () => {
   });
 
   const results: boolean[] = [];
-  for (let i = 0; i < 10; i++) results.push(await bus.publish(envelope("slow", i)));
+  for (let i = 0; i < 10; i++) results.push(await bus.publish(makeEnvelope("slow", i)));
   gate.resolve();
 
   assert.ok(results.filter(Boolean).length <= 3, `accepted ${results.filter(Boolean).length}`);
@@ -116,9 +116,9 @@ test("back-pressure Block waits for room then resolves", async () => {
   });
 
   // 1 taken in-flight, 1 queued, this one must block until a slot frees.
-  await bus.publish(envelope("bp", 0));
-  await bus.publish(envelope("bp", 1));
-  const blocked = bus.publish(envelope("bp", 2), { timeoutMs: 2_000 });
+  await bus.publish(makeEnvelope("bp", 0));
+  await bus.publish(makeEnvelope("bp", 1));
+  const blocked = bus.publish(makeEnvelope("bp", 2), { timeoutMs: 2_000 });
   gate.resolve();
   assert.equal(await blocked, true);
   await bus.shutdown();
@@ -138,7 +138,7 @@ test("nack retries up to maxAttempts then dead-letters", async () => {
     return false;
   });
 
-  await bus.publish(envelope("flaky", "boom"));
+  await bus.publish(makeEnvelope("flaky", "boom"));
   await dead.promise;
   await bus.shutdown();
   assert.equal(tries, 3);
@@ -153,7 +153,7 @@ test("shutdown drains queued work", async () => {
     await sleep(10);
     done++;
   });
-  for (let i = 0; i < 50; i++) await bus.publish(envelope("drain", i));
+  for (let i = 0; i < 50; i++) await bus.publish(makeEnvelope("drain", i));
   assert.equal(await bus.shutdown({ timeoutMs: 10_000 }), true);
   assert.equal(done, 50);
 });
@@ -164,16 +164,16 @@ test("publish is rejected while paused, accepted after resume", async () => {
   const got = deferred<void>();
   bus.subscribe("p", () => got.resolve());
   bus.pause();
-  assert.equal(await bus.publish(envelope("p", 1)), false);
+  assert.equal(await bus.publish(makeEnvelope("p", 1)), false);
   bus.resume();
-  assert.equal(await bus.publish(envelope("p", 2)), true);
+  assert.equal(await bus.publish(makeEnvelope("p", 2)), true);
   await got.promise;
   await bus.shutdown();
 });
 
 test("unknown channel returns false", async () => {
   const bus = new SedaBus();
-  assert.equal(await bus.publish(envelope("nope", 1)), false);
+  assert.equal(await bus.publish(makeEnvelope("nope", 1)), false);
   await bus.shutdown();
 });
 
@@ -188,7 +188,7 @@ test("per-stage concurrency limit is respected", async () => {
     await sleep(15);
     active--;
   });
-  for (let i = 0; i < 30; i++) await bus.publish(envelope("limited", i));
+  for (let i = 0; i < 30; i++) await bus.publish(makeEnvelope("limited", i));
   await bus.shutdown({ timeoutMs: 10_000 });
   assert.equal(peak, 3);
 });
@@ -203,7 +203,7 @@ test("a throwing consumer nacks instead of killing the scheduler", async () => {
   bus.subscribe("boom", () => {
     throw new Error("kaboom");
   });
-  await bus.publish(envelope("boom", 1));
+  await bus.publish(makeEnvelope("boom", 1));
   await dead.promise;
   await bus.shutdown();
   assert.equal(bus.stats()["boom"]!.deadLettered, 1);

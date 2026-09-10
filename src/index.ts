@@ -13,6 +13,6 @@ export {
   type PublishOptions,
   type WorkerOptions,
 } from "./policy.js";
-export { advance, envelope, type Envelope, type EnvelopeInit } from "./envelope.js";
+export { Envelope, makeEnvelope, targetService, type EnvelopeInit } from "./envelope.js";
 
 export const version = "0.1.0";

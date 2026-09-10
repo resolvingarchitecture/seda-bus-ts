@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import type { Envelope } from "../../src/index.js";
+
+import type { Envelope } from "@resolvingarchitecture/ra-common";
 
 interface Job {
   seed: string;
@@ -7,11 +8,12 @@ interface Job {
 }
 
 /** CPU-bound stage: iterated SHA-256, to show real off-thread parallelism. */
-export default function hash(env: Envelope<Job>): boolean {
-  let acc = Buffer.from(env.payload.seed);
-  for (let i = 0; i < env.payload.rounds; i++) {
+export default function hash(env: Envelope): boolean {
+  const job = env.content() as Job;
+  let acc = Buffer.from(job.seed);
+  for (let i = 0; i < job.rounds; i++) {
     acc = createHash("sha256").update(acc).digest();
   }
-  env.headers.digest = acc.toString("hex").slice(0, 12);
+  env.headers["digest"] = acc.toString("hex").slice(0, 12);
   return true;
 }

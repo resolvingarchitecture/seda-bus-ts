@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { availableParallelism } from "node:os";
 import { test } from "node:test";
 
-import { Delivery, SedaBus, envelope, type Envelope } from "../src/index.js";
+import { Delivery, SedaBus, makeEnvelope, type Envelope } from "../src/index.js";
 
 const uppercase = new URL("./fixtures/uppercase-stage.ts", import.meta.url);
 const hash = new URL("./fixtures/hash-stage.ts", import.meta.url);
@@ -18,15 +18,15 @@ test("a worker stage runs the handler and mutations flow back", async () => {
   const bus = new SedaBus();
   bus.channel("upper", { capacity: 10, worker: { module: uppercase, pool: 2 } });
 
-  const done = deferred<Envelope<string>>();
-  await bus.publish(envelope<string>("upper", "hello"), {
-    onComplete: (e) => done.resolve(e as Envelope<string>),
+  const done = deferred<Envelope>();
+  await bus.publish(makeEnvelope("upper", "hello"), {
+    onComplete: (e) => done.resolve(e),
   });
   const e = await done.promise;
   await bus.shutdown();
 
-  assert.equal(e.payload, "HELLO");
-  assert.equal(e.headers.transformedBy, "worker");
+  assert.equal(e.content(), "HELLO");
+  assert.equal(e.headers["transformedBy"], "worker");
   assert.equal(bus.stats()["upper"]!.delivered, 1);
 });
 
@@ -54,7 +54,7 @@ test("a worker handler that nacks is retried then dead-lettered", async () => {
   const dead = deferred<void>();
   bus.subscribe("dead", () => dead.resolve());
 
-  await bus.publish(envelope("flaky", 1));
+  await bus.publish(makeEnvelope("flaky", 1));
   await dead.promise;
   await bus.shutdown();
   assert.equal(bus.stats()["flaky"]!.deadLettered, 1);
@@ -76,7 +76,7 @@ test("a worker stage parallelises CPU-bound work across threads", { timeout: 60_
     const started = Date.now();
     for (let i = 0; i < count; i++) {
       await bus.publish(
-        envelope("hash", { seed: `s${i}`, rounds }),
+        makeEnvelope("hash", { seed: `s${i}`, rounds }),
         {
           onComplete: () => {
             if (++done === count) all.resolve();

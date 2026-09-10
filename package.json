@@ -1,6 +1,6 @@
 {
   "name": "@resolvingarchitecture/seda-bus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A small, broker-less, staged (SEDA-style) message bus for TypeScript / Node",
   "type": "module",
   "main": "./dist/index.js",
@@ -43,6 +43,9 @@
   "homepage": "https://resolvingarchitecture.io",
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@resolvingarchitecture/ra-common": "file:../../common/ra-common-ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

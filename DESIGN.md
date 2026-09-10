@@ -46,17 +46,20 @@ threads instead — see *Transports* below.
 
 ## Core types
 
-### `Envelope<T>`
+### `Envelope`
 
-The unit of work. `id` is stable across every hop. `slip` is a routing slip
-(itinerary) held as a plain array and consumed **FIFO** — `slip: ["a","b","c"]`
-visits `a → b → c` in order. (This differs from `seda-bus-java`, whose slip
-comes from `ra.common` and is a LIFO stack.)
+The unit of work — `Envelope` from `@resolvingarchitecture/ra-common`, the same
+wrapper `seda-bus-java` carries via `ra-common-java`. `id` is stable across every
+hop. Routing is driven by the envelope's `DynamicRoutingSlip`: each hop targets
+`route.service`, and the slip is a **LIFO** stack walked with `env.ratchet()`.
+`makeEnvelope(to, payload, { slip })` builds one so `nextRoute()` yields `to`,
+then `slip[0]`, `slip[1]`, … ; `targetService(env)` reads the current target; the
+payload is the document `CONTENT` value.
 
-### `Consumer<T>`
+### `Consumer`
 
 ```ts
-type Consumer<T> = (env: Envelope<T>) => boolean | void | Promise<boolean | void>;
+type Consumer = (env: Envelope) => boolean | void | Promise<boolean | void>;
 ```
 
 Return `false` to **nack** (retry, then dead-letter). `true` or `void` acks.
@@ -156,12 +159,13 @@ boundary), run across a fixed pool of `Worker` threads.
   awaits the reply, releases the worker. A worker that errors or exits non-zero
   is terminated and replaced (its in-flight envelope resolves as a nack).
 - **`worker/harness.ts`** runs inside each thread: `import()`s the module once,
-  then for every request calls the handler and posts back
-  `{ seq, ok, envelope }`.
-- The envelope crosses by **structured clone** (`postMessage`). It is returned
-  in the reply, and `WorkerTransport` copies `payload` / `headers` / `slip` back
-  onto the main-thread envelope — so worker stages compose in routing slips.
-  `id`, `to`, and `attempts` stay main-thread-controlled.
+  then for every request rehydrates the envelope (`Envelope.fromJSON`), calls the
+  handler, and posts back `{ seq, ok, envelope: env.toJSON() }`.
+- The envelope crosses as **JSON** (`env.toJSON()` — a plain, structured-clone-safe
+  object). It is returned in the reply, and `WorkerTransport` rehydrates it and
+  `Object.assign`s the data props back onto the main-thread envelope — so worker
+  stages compose in routing slips. Per-hop `attempts` stay on the channel,
+  main-thread-controlled.
 - The queue, waiters, back-pressure, retry, and metrics all stay on the main
   thread. Only the handler call is off-thread.
 - `addConsumer` throws. `pub/sub` + `worker` throws at channel registration.
@@ -177,16 +181,18 @@ made absolute against `process.cwd()` then `pathToFileURL`.
 
 On ack, `completeHop`:
 
-1. if `slip` is non-empty: `env.to = slip.shift()`, reset `attempts`, re-publish
-   (with a 5s `Block` timeout so an in-flight itinerary is not lost to a full
-   downstream queue);
+1. if `dynamicRoutingSlip.peekAtNextRoute()` is set: `env.ratchet()` and
+   re-publish (with a 5s `Block` timeout so an in-flight itinerary is not lost to
+   a full downstream queue);
 2. else: fire the `onComplete` callback registered at publish time.
 
 ## Retry & dead-letter
 
-A nacked envelope with `attempts < maxAttempts` is `unshift`ed back to the head
-of its queue. Once attempts are exhausted it is routed to the source channel's
-dead-letter channel (if `setDeadLetterChannel` was called) and the `onComplete`
+Per-hop delivery attempts live on the `Channel` (a `Map` keyed by envelope id,
+mirroring `SEDAMessageChannel.attempts` in `seda-bus-java`). A nacked envelope
+with `attempt < maxAttempts` is `unshift`ed back to the head of its queue. Once
+attempts are exhausted its count is cleared, it is routed to the source channel's
+dead-letter channel (if `setDeadLetterChannel` was called), and the `onComplete`
 callback, if any, is dropped.
 
 ## Lifecycle

@@ -12,7 +12,8 @@
  * and shed load automatically. That adaptive controller is future work (see
  * DESIGN.md).
  */
-import { advance, type Envelope } from "./envelope.js";
+import { targetService } from "./envelope.js";
+import type { Envelope } from "./envelope.js";
 import {
   Backpressure,
   Delivery,
@@ -35,6 +36,7 @@ export type {
   PublishOptions,
   WorkerOptions,
 } from "./policy.js";
+export { Envelope, makeEnvelope, targetService, type EnvelopeInit } from "./envelope.js";
 
 /** Envelopes one drain turn handles before yielding back to the scheduler. */
 const BATCH = 32;
@@ -57,7 +59,19 @@ class Channel {
 
   private readonly queue: Envelope[] = [];
   private readonly waiters: Waiter[] = [];
+  /** per-hop delivery attempts, keyed by envelope id (mirrors seda-bus-java). */
+  private readonly attempts = new Map<string, number>();
   inFlight = 0;
+
+  bumpAttempt(id: string): number {
+    const n = (this.attempts.get(id) ?? 0) + 1;
+    this.attempts.set(id, n);
+    return n;
+  }
+
+  clearAttempt(id: string): void {
+    this.attempts.delete(id);
+  }
 
   readonly stats: ChannelStats = {
     depth: 0,
@@ -258,8 +272,8 @@ export class SedaBus {
     return this;
   }
 
-  subscribe<T = unknown>(name: string, consumer: Consumer<T>): this {
-    this.getOrCreate(name).transport.addConsumer(consumer as Consumer);
+  subscribe(name: string, consumer: Consumer): this {
+    this.getOrCreate(name).transport.addConsumer(consumer);
     return this;
   }
 
@@ -286,10 +300,11 @@ export class SedaBus {
 
   // -- publishing --------------------------------------------------
 
-  /** Publish an envelope to the channel named by `env.to`. Resolves true if accepted. */
+  /** Publish an envelope to the channel named by its current route. Resolves true if accepted. */
   async publish(env: Envelope, opts: PublishOptions = {}): Promise<boolean> {
     if (!this.running || !this.accepting) return false;
-    const ch = this.channels.get(env.to);
+    const name = targetService(env);
+    const ch = name !== undefined ? this.channels.get(name) : undefined;
     if (!ch) return false;
     if (opts.onComplete) this.callbacks.set(env.id, opts.onComplete);
     const accepted = await ch.offer(env, opts);
@@ -331,23 +346,26 @@ export class SedaBus {
   }
 
   private async process(ch: Channel, env: Envelope): Promise<void> {
-    env.attempts++;
+    const attempt = ch.bumpAttempt(env.id);
     const ok = await ch.transport.invoke(env);
 
     if (ok) {
       ch.stats.delivered++;
+      ch.clearAttempt(env.id);
       await this.completeHop(env);
-    } else if (env.attempts < ch.maxAttempts) {
+    } else if (attempt < ch.maxAttempts) {
       ch.stats.nacked++;
       ch.requeue(env);
     } else {
       ch.stats.nacked++;
+      ch.clearAttempt(env.id);
       this.deadLetter(ch, env);
     }
   }
 
   private async completeHop(env: Envelope): Promise<void> {
-    if (advance(env)) {
+    if (env.dynamicRoutingSlip.peekAtNextRoute() !== undefined) {
+      env.ratchet();
       await this.publish(env, { timeoutMs: 5_000 });
       return;
     }

@@ -4,7 +4,7 @@
  *   npm run example:parallel
  */
 import { availableParallelism } from "node:os";
-import { SedaBus, envelope, type Envelope } from "../src/index.js";
+import { SedaBus, makeEnvelope, type Envelope } from "../src/index.js";
 
 const fibStage = new URL("./stages/fib.ts", import.meta.url);
 
@@ -18,7 +18,7 @@ async function run(pool: number, jobs: number, n: number): Promise<number> {
   const started = Date.now();
 
   for (let i = 0; i < jobs; i++) {
-    await bus.publish(envelope("fib", { n }), {
+    await bus.publish(makeEnvelope("fib", { n }), {
       onComplete: (_e: Envelope) => {
         if (++done === jobs) resolveAll();
       },
