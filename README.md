@@ -145,11 +145,30 @@ Same design, other languages:
 | [seda-bus-java](https://github.com/resolvingarchitecture/seda-bus-java) | Java, with optional guaranteed-delivery persistence |
 | [seda-bus-python](https://github.com/resolvingarchitecture/seda-bus-python) | Python, built to exercise free-threaded (PEP 703) CPython |
 
+## Correctness suite coverage
+
+See [`../CORRECTNESS_SUITE.md`](../CORRECTNESS_SUITE.md) for what C1-C7 mean
+and why this table exists. All in `test/bus.test.ts` unless noted.
+
+| # | Property | Test(s) |
+|---|---|---|
+| C1 | Backpressure (Block/Reject/DropNewest/DropOldest) | "back-pressure Block waits for room then resolves", "back-pressure Reject sheds when the queue is full", "back-pressure DropNewest sheds the incoming envelope like Reject", "back-pressure DropOldest always admits by evicting the oldest queued envelope" |
+| C2 | Retry -> dead-letter | "nack retries up to maxAttempts then dead-letters", "a nack that succeeds on its final allowed attempt is delivered exactly once", "a channel with no consumers dead-letters (default maxAttempts=1: on the first attempt)" |
+| C3 | Consumer failure isolation | "a throwing consumer nacks instead of killing the scheduler" |
+| C4 | Shutdown accounting | "shutdown accounting: every published envelope is delivered or dead-lettered when fully drained", "shutdown accounting still holds when the timeout elapses before draining" |
+| C5 | Config validation is defined | "channel construction clamps non-positive capacity/concurrency to 1 instead of misbehaving" |
+| C6 | No resource leak across lifecycles | "repeated create/shutdown cycles do not leak active handles" (`process._getActiveHandles()` before/after 25 cycles - the nearest single-threaded-event-loop equivalent of a thread-count check) |
+| C7 | Concurrency correctness | `test/worker.test.ts`: "a worker stage parallelises CPU-bound work across threads"; point-to-point/pub-sub tests above exercise concurrent delivery on the default inline transport |
+
+Not covered here: `WorkerPool`'s crash-and-replace path (a worker thread
+dying mid-job) has no dedicated test - noted as a gap, not fixed in this
+pass.
+
 ## Develop
 
 ```sh
 npm install
-npm test               # node:test via tsx  (16 cases)
+npm test               # node:test via tsx  (24 cases)
 npm run example        # 3-stage inline pipeline
 npm run example:parallel   # worker_threads CPU stage, pool 1 vs N
 npm run build          # -> dist/ (js + d.ts)
@@ -157,7 +176,7 @@ npm run build          # -> dist/ (js + d.ts)
 
 ## Status
 
-`0.1.0` &mdash; working core incl. `worker_threads` stages, tested (16 cases).
+`0.1.0` &mdash; working core incl. `worker_threads` stages, tested (24 cases).
 Not published to npm yet.
 
 ## Reference

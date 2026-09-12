@@ -209,6 +209,175 @@ test("a throwing consumer nacks instead of killing the scheduler", async () => {
   assert.equal(bus.stats()["boom"]!.deadLettered, 1);
 });
 
+test("back-pressure DropNewest sheds the incoming envelope like Reject", async () => {
+  const bus = new SedaBus();
+  const gate = deferred<void>();
+  bus.channel("dn", { capacity: 2, concurrency: 1, backpressure: Backpressure.DropNewest });
+  bus.subscribe("dn", async () => {
+    await gate.promise;
+  });
+
+  const results: boolean[] = [];
+  for (let i = 0; i < 10; i++) results.push(await bus.publish(makeEnvelope("dn", i)));
+  gate.resolve();
+
+  assert.ok(results.filter(Boolean).length <= 3, `accepted ${results.filter(Boolean).length}`);
+  await bus.shutdown();
+  assert.ok(bus.stats()["dn"]!.dropped >= 7);
+});
+
+test("back-pressure DropOldest always admits by evicting the oldest queued envelope", async () => {
+  const bus = new SedaBus();
+  const gate = deferred<void>();
+  const delivered: number[] = [];
+  bus.channel("do", { capacity: 2, concurrency: 1, backpressure: Backpressure.DropOldest });
+  bus.subscribe("do", async (e) => {
+    if (delivered.length === 0) await gate.promise; // hold the one in-flight slot open
+    delivered.push(e.content() as number);
+  });
+
+  const results: boolean[] = [];
+  for (let i = 0; i < 10; i++) results.push(await bus.publish(makeEnvelope("do", i)));
+  assert.ok(results.every(Boolean), "DropOldest must never refuse admission");
+  gate.resolve();
+  await bus.shutdown({ timeoutMs: 10_000 });
+
+  // Only the in-flight envelope plus whatever survived eviction in the
+  // 2-slot queue ever gets delivered - proves eviction actually happened
+  // rather than the queue silently growing past capacity.
+  assert.ok(delivered.length < 10, `expected some eviction, delivered ${delivered.length}`);
+  assert.ok(bus.stats()["do"]!.dropped > 0);
+});
+
+test("a nack that succeeds on its final allowed attempt is delivered exactly once", async () => {
+  const bus = new SedaBus();
+  let tries = 0;
+  const done = deferred<void>();
+  bus.channel("almost", { capacity: 10, maxAttempts: 3 });
+  bus.subscribe("almost", () => {
+    tries++;
+    if (tries < 3) return false;
+    done.resolve();
+    return true;
+  });
+
+  await bus.publish(makeEnvelope("almost", "x"));
+  await done.promise;
+  await bus.shutdown();
+  assert.equal(tries, 3);
+  assert.equal(bus.stats()["almost"]!.delivered, 1);
+  assert.equal(bus.stats()["almost"]!.nacked, 2);
+  assert.equal(bus.stats()["almost"]!.deadLettered, 0);
+});
+
+test("a channel with no consumers dead-letters (default maxAttempts=1: on the first attempt)", async () => {
+  const bus = new SedaBus();
+  const dead = deferred<void>();
+  bus.channel("orphan", { capacity: 10 });
+  bus.channel("dlq2", { capacity: 10 });
+  bus.setDeadLetterChannel("orphan", "dlq2");
+  bus.subscribe("dlq2", () => dead.resolve());
+
+  await bus.publish(makeEnvelope("orphan", 1));
+  await dead.promise;
+  await bus.shutdown();
+  assert.equal(bus.stats()["orphan"]!.deadLettered, 1);
+});
+
+test("shutdown accounting: every published envelope is delivered or dead-lettered when fully drained", async () => {
+  const bus = new SedaBus();
+  const total = 20;
+  bus.channel("acct", { capacity: 100, concurrency: 4, maxAttempts: 1 });
+  bus.subscribe("acct", async () => {
+    await sleep(30);
+    return true;
+  });
+  for (let i = 0; i < total; i++) {
+    assert.equal(await bus.publish(makeEnvelope("acct", i)), true);
+  }
+
+  const drained = await bus.shutdown({ timeoutMs: 10_000 });
+  const s = bus.stats()["acct"]!;
+  assert.equal(drained, true);
+  assert.equal(s.delivered + s.deadLettered, total);
+  assert.equal(s.depth, 0);
+  assert.equal(s.inFlight, 0);
+});
+
+test("shutdown accounting still holds when the timeout elapses before draining", async () => {
+  const bus = new SedaBus();
+  const total = 20;
+  bus.channel("acct2", { capacity: 100, concurrency: 4, maxAttempts: 1 });
+  bus.subscribe("acct2", async () => {
+    await sleep(200); // deliberately slower than the shutdown timeout below
+    return true;
+  });
+  for (let i = 0; i < total; i++) {
+    assert.equal(await bus.publish(makeEnvelope("acct2", i)), true);
+  }
+
+  const drained = await bus.shutdown({ timeoutMs: 50 });
+  const s = bus.stats()["acct2"]!;
+  assert.equal(drained, false, "expected the short timeout to elapse before draining");
+  // Every published envelope is accounted for exactly once - finished
+  // (delivered/dead-lettered) or still visible as queued/in-flight - never
+  // silently lost, and never double-counted, even when shutdown times out.
+  assert.equal(s.delivered + s.deadLettered + s.depth + s.inFlight, total);
+});
+
+test("channel construction clamps non-positive capacity/concurrency to 1 instead of misbehaving", async () => {
+  const bus = new SedaBus();
+  const started = deferred<void>();
+  const gate = deferred<void>();
+  bus.channel("zero", { capacity: 0, concurrency: 0 });
+  bus.subscribe("zero", async () => {
+    started.resolve();
+    await gate.promise;
+  });
+
+  // capacity clamped to >= 1: a fresh channel must accept at least one publish.
+  assert.equal(await bus.publish(makeEnvelope("zero", 1)), true);
+  // concurrency clamped to >= 1: the sole worker slot must actually run it.
+  await started.promise;
+  gate.resolve();
+  await bus.shutdown();
+});
+
+test("repeated create/shutdown cycles do not leak active handles", async () => {
+  const activeHandles = (): number =>
+    (process as unknown as { _getActiveHandles(): unknown[] })._getActiveHandles().length;
+
+  // Warm up once outside the measured loop - a first run can lazily
+  // initialise globals that aren't part of what we're checking for growth.
+  {
+    const bus = new SedaBus();
+    bus.channel("warmup", { capacity: 10 });
+    bus.subscribe("warmup", () => true);
+    await bus.publish(makeEnvelope("warmup", 0));
+    await bus.shutdown();
+  }
+
+  const before = activeHandles();
+  for (let i = 0; i < 25; i++) {
+    const bus = new SedaBus();
+    bus.channel("cycle", { capacity: 10 });
+    bus.subscribe("cycle", () => true);
+    await bus.publish(makeEnvelope("cycle", i));
+    await bus.shutdown();
+  }
+  const after = activeHandles();
+
+  // process._getActiveHandles() is an internal, undocumented Node API - the
+  // only practical way to observe "did this leave a timer/socket/etc.
+  // registered with the event loop" from user code. Used deliberately here
+  // as the nearest single-threaded-event-loop equivalent of a thread-count
+  // check in a threaded port (see CORRECTNESS_SUITE.md's C6).
+  assert.ok(
+    after <= before + 2,
+    `active handles grew from ${before} to ${after} over 25 create/shutdown cycles`,
+  );
+});
+
 async function waitFor(pred: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!pred() && Date.now() < deadline) await sleep(5);
