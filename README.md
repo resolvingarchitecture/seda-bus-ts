@@ -147,7 +147,7 @@ Same design, other languages:
 
 ## Correctness suite coverage
 
-See [`../seda-bus-design/CORRECTNESS_SUITE.md`](../seda-bus-design/CORRECTNESS_SUITE.md) for what C1-C7 mean
+See [`seda-bus-design/CORRECTNESS_SUITE.md`](https://github.com/resolvingarchitecture/seda-bus-design/blob/master/CORRECTNESS_SUITE.md) for what C1-C7 mean
 and why this table exists. All in `test/bus.test.ts` unless noted.
 
 | # | Property | Test(s) |
